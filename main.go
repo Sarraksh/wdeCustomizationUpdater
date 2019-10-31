@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const programVersion string = "1.1.0.0"          //Program version
+const programVersion string = "1.1.1.0"          //Program version
 const confFile string = "application.cfg"        //Configuration file name
 const logHistLayout string = "2006.01.02_150405" //Layout for "log" and "history" filenames time appending
 
@@ -192,6 +192,12 @@ func main() {
 
 	filesList := make(map[string]time.Time) //make map for customisation files
 
+	//Prepare regexps to skip redundant files
+	reReadme := regexp.MustCompile(`[Rr][Ee][Aa][Dd][Mm][Ee]`)
+	rePDB := regexp.MustCompile(`\.[Pp][Dd][Bb]$`)
+
+	skipReason := ""
+
 	//Analysis of the contents of the finded customization folders.
 	for _, cFolder := range customsFoldersList {
 		_, err = historyFile.WriteString("---------------" + cFolder + "\n")
@@ -239,20 +245,48 @@ func main() {
 				out := filepath.Join(WDEPath, path)
 				log.Printf("[DEBUG] - Copy file (Destination)\t%s\n", out)
 
-				//Check if file already copied
-				if _, ok := filesList[out]; ok {
-					//Chek modification time and replase if newer
-					if filesList[out].Before(fi.ModTime()) {
-						log.Printf("[DEBUG] - File replaced with a newer version (REPLACE)\t%s\n", out)
+				//Check files to skip redundant
+				if reReadme.MatchString(path) {
+					skipReason = "Readme"
+				}
+				if rePDB.MatchString(path) {
+					skipReason = ".PDB"
+				}
 
-						//exec OS copy comand
-						cmd := exec.Command("cmd", "/C", "copy", "/Y", tmpP, out)
-						err = cmd.Run()
-						if err != nil {
-							log.Println("[ERROR] - Error copy file from %v to %v\n", tmpP, out)
-							log.Fatal(err)
+				if skipReason != "" {
+					_, err = historyFile.WriteString("REDUNDANT - " + skipReason + " - " + path + "\n")
+					if err != nil {
+						log.Println(err)
+						log.Println("[ERROR] - Error writing history. No further history will be recorded.")
+						historyFile.Close()
+					}
+					log.Printf("[DEBUG] - Not copied  (REDUNDANT)\t%s\n", out)
+					skipReason = ""
+				} else {
+
+					//Check if file already copied
+					if _, ok := filesList[out]; ok {
+						//Chek modification time and replase if newer
+						if filesList[out].Before(fi.ModTime()) {
+							log.Printf("[DEBUG] - File replaced with a newer version (REPLACE)\t%s\n", out)
+
+							//exec OS copy comand
+							cmd := exec.Command("cmd", "/C", "copy", "/Y", tmpP, out)
+							err = cmd.Run()
+							if err != nil {
+								log.Println("[ERROR] - Error copy file from %v to %v\n", tmpP, out)
+								log.Fatal(err)
+							} else {
+								_, err = historyFile.WriteString("REPLACE - File replaced with a newer version - " + path + "\n")
+								if err != nil {
+									log.Println(err)
+									log.Println("[ERROR] - Error writing history. No further history will be recorded.")
+									historyFile.Close()
+								}
+							}
 						} else {
-							_, err = historyFile.WriteString("REPLACE - File replaced with a newer version - " + path + "\n")
+							log.Printf("[DEBUG] - FIle not copied  (NOPE)\t%s\n", out)
+							_, err = historyFile.WriteString("SKIP - File already exist - " + path + "\n")
 							if err != nil {
 								log.Println(err)
 								log.Println("[ERROR] - Error writing history. No further history will be recorded.")
@@ -260,50 +294,42 @@ func main() {
 							}
 						}
 					} else {
-						log.Printf("[DEBUG] - FIle not copied  (NOPE)\t%s\n", out)
-						_, err = historyFile.WriteString("SKIP - File already exist - " + path + "\n")
+						filesList[out] = fi.ModTime()
+						re1 := regexp.MustCompile(`\\`)
+						re2 := regexp.MustCompile(`^[0-9A-Za-z: _]*`)
+						//check if file mast be plased in subfolder or in root and feel registry key
+						if re1.MatchString(path) {
+							registryCustomFiles = registryCustomFiles + AppFile1 + fi.Name() + AppFile2 + re2.FindString(path) + AppFile3
+							log.Printf("[INFO ] - Copy file   (SUBFOLDER)\t%s\n", re2.FindString(path))
+
+							//check subfolder existing and if not create it
+							outDir := filepath.Dir(out)
+							if _, err := os.Stat(outDir); os.IsNotExist(err) {
+								log.Printf("[DEBUG] - subfolder does not exists. Creating - %v\n", logFolderPath)
+								os.Mkdir(outDir, 777)
+							}
+						} else {
+							log.Printf("[INFO ] - Copy file        (ROOT)\t%s\n", fi.Name())
+							registryCustomFiles = registryCustomFiles + AppFile1 + fi.Name() + AppFile2 + AppFile3
+						}
+
+						//exec OS copy comand
+						cmd := exec.Command("cmd", "/C", "copy", "/Y", tmpP, out)
+						err = cmd.Run()
 						if err != nil {
-							log.Println(err)
-							log.Println("[ERROR] - Error writing history. No further history will be recorded.")
-							historyFile.Close()
+							log.Printf("[ERROR] - Error while copy file from %v to %v\n", tmpP, out)
+							log.Fatal(err)
+						} else {
+							_, err = historyFile.WriteString("DONE - " + path + "\n")
+							if err != nil {
+								log.Println(err)
+								log.Println("[ERROR] - Error writing history. No further history will be recorded.")
+								historyFile.Close()
+							}
 						}
-					}
-				} else {
-					filesList[out] = fi.ModTime()
-					re1 := regexp.MustCompile(`\\`)
-					re2 := regexp.MustCompile(`^[0-9A-Za-z: _]*`)
-					//check if file mast be plased in subfolder or in root and feel registry key
-					if re1.MatchString(path) {
-						registryCustomFiles = registryCustomFiles + AppFile1 + fi.Name() + AppFile2 + re2.FindString(path) + AppFile3
-						log.Printf("[INFO ] - Copy file   (SUBFOLDER)\t%s\n", re2.FindString(path))
 
-						//check subfolder existing and if not create it
-						outDir := filepath.Dir(out)
-						if _, err := os.Stat(outDir); os.IsNotExist(err) {
-							log.Printf("[DEBUG] - subfolder does not exists. Creating - %v\n", logFolderPath)
-							os.Mkdir(outDir, 777)
-						}
-					} else {
-						log.Printf("[INFO ] - Copy file        (ROOT)\t%s\n", fi.Name())
-						registryCustomFiles = registryCustomFiles + AppFile1 + fi.Name() + AppFile2 + AppFile3
+						log.Printf("[INFO ] - Copy file        (Done)\t%s\n", out)
 					}
-
-					//exec OS copy comand
-					cmd := exec.Command("cmd", "/C", "copy", "/Y", tmpP, out)
-					err = cmd.Run()
-					if err != nil {
-						log.Printf("[ERROR] - Error while copy file from %v to %v\n", tmpP, out)
-						log.Fatal(err)
-					} else {
-						_, err = historyFile.WriteString("DONE - " + path + "\n")
-						if err != nil {
-							log.Println(err)
-							log.Println("[ERROR] - Error writing history. No further history will be recorded.")
-							historyFile.Close()
-						}
-					}
-
-					log.Printf("[INFO ] - Copy file        (Done)\t%s\n", out)
 				}
 			}
 			log.Printf("+++++++++++++++++++++")
@@ -330,6 +356,7 @@ func main() {
 	log.Printf("\n===\n\n\n\n\n===\n") //Visual break in the log
 
 	//Write "CustomFiles" into registry
+	log.Println("[DEBUG] - Start write into registry")
 	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Genesys\DeploymentManager`, registry.QUERY_VALUE|registry.SET_VALUE)
 	if err != nil {
 		log.Fatal(err)
@@ -337,9 +364,13 @@ func main() {
 	if err := k.SetStringValue("CustomFiles", registryCustomFiles); err != nil {
 		log.Fatal(err)
 	}
+	if err := k.SetStringValue("AddCustomFile", "True"); err != nil {
+		log.Fatal(err)
+	}
 	if err := k.Close(); err != nil {
 		log.Fatal(err)
 	}
+	log.Println("[DEBUG] - Stop write into registry")
 
 	//Run InteractionWorkspaceDeploymentManager
 	os.Chdir(WDEPath)
