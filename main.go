@@ -13,15 +13,23 @@ import (
 	"time"
 )
 
-const programVersion string = "1.1.1.1"          //Program version
-const confFile string = "application.cfg"        //Configuration file name
-const logHistLayout string = "2006.01.02_150405" //Layout for "log" and "history" filenames time appending
+const (
+	programVersion string = "1.1.2.0"              //Program version
+	confFile       string = "application.cfg"      //Configuration file name
+	logHistLayout  string = "2006.01.02_150405"    //Layout for "log" and "history" filenames time appending
+	logBreakString        = "\n===\n\n\n\n\n===\n" //String for visual break in log file
+
+	//Initialization of the constants for fill up "CustomFiles" registry key
+	AppFile1 = "  <ApplicationFile FileName=\""
+	AppFile2 = "\" RelativePath=\""
+	AppFile3 = "\" DataFile=\"false\" EntryPoint=\"false\" IsMainConfigFile=\"false\" Optional=\"false\" GroupName=\"\" />\n"
+)
 
 func main() {
 
-	startTime := time.Now()                            //save start time
+	startTime := time.Now()                            //Save start time
 	startTimeString := startTime.Format(logHistLayout) //Get string from startTime
-	programDirectory, _ := os.Getwd()                  //save program folder
+	programDirectory, _ := os.Getwd()                  //Save program folder
 
 	//Generate log file name
 	logFilePath := "WDECustoms_LOG_" + startTimeString + ".txt"
@@ -148,7 +156,7 @@ func main() {
 		return
 	}
 
-	log.Printf("\n===\n\n\n\n\n===\n") //Visual break in the log
+	log.Printf(logBreakString) //Visual break in the log
 
 	//Get folders list in CustomizationsFolder
 	customsFoldersList, err := GetCustomFoldersList(customsPath)
@@ -177,10 +185,6 @@ func main() {
 
 	//Initialization of the variable for the "CustomFiles" registry key value
 	registryCustomFiles := "<?xml version=\"1.0\" encoding=\"utf-16\"?>\n<ArrayOfApplicationFile xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\">\n"
-	//Initialization of the variables for fill up "CustomFiles" registry key
-	AppFile1 := "  <ApplicationFile FileName=\""
-	AppFile2 := "\" RelativePath=\""
-	AppFile3 := "\" DataFile=\"false\" EntryPoint=\"false\" IsMainConfigFile=\"false\" Optional=\"false\" GroupName=\"\" />\n"
 
 	//Put list of copyed files into history file
 	_, err = historyFile.WriteString("=============Copyed Files=============\n")
@@ -190,11 +194,18 @@ func main() {
 		historyFile.Close()
 	}
 
-	filesList := make(map[string]time.Time) //make map for customisation files
+	log.Printf("[DEBUG] - Customizations folders counted - %d", len(customsFoldersList))
+	filesList := make(map[string]time.Time, len(customsFoldersList)*5) //make map for customisation files
+	log.Printf("[DEBUG] - Customizations files expecting - %d", len(customsFoldersList)*5)
 
-	//Prepare regexps to skip redundant files
+	//Prepare regexps
+
+	//to skip redundant files
 	reReadme := regexp.MustCompile(`[Rr][Ee][Aa][Dd][Mm][Ee]`)
 	rePDB := regexp.MustCompile(`\.[Pp][Dd][Bb]$`)
+	//to handle files in subfulders
+	reIsFilePath := regexp.MustCompile(`\\`)
+	reGetSubfolder := regexp.MustCompile(`^[0-9A-Za-z: _]*`)
 
 	skipReason := ""
 
@@ -300,12 +311,10 @@ func main() {
 						}
 					} else {
 						filesList[out] = fi.ModTime()
-						re1 := regexp.MustCompile(`\\`)
-						re2 := regexp.MustCompile(`^[0-9A-Za-z: _]*`)
 						//check if file mast be plased in subfolder or in root and feel registry key
-						if re1.MatchString(path) {
-							registryCustomFiles = registryCustomFiles + AppFile1 + fi.Name() + AppFile2 + re2.FindString(path) + AppFile3
-							log.Printf("[INFO ] - Copy file   (SUBFOLDER)\t%s\n", re2.FindString(path))
+						if reIsFilePath.MatchString(path) {
+							registryCustomFiles = registryCustomFiles + AppFile1 + fi.Name() + AppFile2 + reGetSubfolder.FindString(path) + AppFile3
+							log.Printf("[INFO ] - Copy file   (SUBFOLDER)\t%s\n", reGetSubfolder.FindString(path))
 
 							//check subfolder existing and if not create it
 							outDir := filepath.Dir(out)
@@ -344,21 +353,21 @@ func main() {
 			log.Println(err)
 		}
 	}
-	log.Printf("\n===\n\n\n\n\n===\n") //Visual break in the log
+	log.Printf(logBreakString) //Visual break in the log
 
 	//Write filesList into log file
 	for s, b := range filesList {
 		log.Printf("%v\t- %v\n", b, s)
 	}
 
-	log.Printf("\n===\n\n\n\n\n===\n") //Visual break in the log
+	log.Printf(logBreakString) //Visual break in the log
 
 	//Finalisation of the variable for the "CustomFiles" registry key value
 	registryCustomFiles = registryCustomFiles + "  <ApplicationFile FileName=\"Genesys.Desktop.Modules.NewFacebookData.dll\" RelativePath=\"\" DataFile=\"false\" EntryPoint=\"false\" IsMainConfigFile=\"false\" Optional=\"false\" GroupName=\"\" />"
 	registryCustomFiles = registryCustomFiles + "</ArrayOfApplicationFile>"
 	log.Println(registryCustomFiles) //Write into log variable for the "CustomFiles" registry key value
 
-	log.Printf("\n===\n\n\n\n\n===\n") //Visual break in the log
+	log.Printf(logBreakString) //Visual break in the log
 
 	//Write "CustomFiles" into registry
 	log.Println("[DEBUG] - Start write into registry")
@@ -407,7 +416,7 @@ func GetCustomFoldersList(folder string) ([]string, error) {
 		return nil, err
 	}
 	log.Println("[DEBUG] - [GetCustomFoldersList] - [Dir Readed]")
-	f := make([]string, 0)
+	foldersList := make([]string, 0, 20)
 	for _, s := range files {
 		log.Printf("[DEBUG] - [GetCustomFoldersList] - [ITEM] - %T %+v\n", s.Name(), s.Name())
 		sss := filepath.Join(folder, s.Name())
@@ -420,9 +429,9 @@ func GetCustomFoldersList(folder string) ([]string, error) {
 		switch mode := fi.Mode(); {
 		case mode.IsDir():
 			log.Println("[DEBUG] - [GetCustomFoldersList] - Dir Finded - %s", s.Name())
-			f = append(f, s.Name())
+			foldersList = append(foldersList, s.Name())
 		}
 	}
 	log.Println("[DEBUG] - [GetCustomFoldersList] - Stoped")
-	return f, nil
+	return foldersList, nil
 }
