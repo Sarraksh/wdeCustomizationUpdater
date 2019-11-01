@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const programVersion string = "1.1.1.0"          //Program version
+const programVersion string = "1.1.1.1"          //Program version
 const confFile string = "application.cfg"        //Configuration file name
 const logHistLayout string = "2006.01.02_150405" //Layout for "log" and "history" filenames time appending
 
@@ -267,6 +267,10 @@ func main() {
 					//Check if file already copied
 					if _, ok := filesList[out]; ok {
 						//Chek modification time and replase if newer
+						log.Printf("[DEBUG] - Previous file name      - %v", out)
+						log.Printf("[DEBUG] - Previous file mod time  - %v", filesList[out])
+						log.Printf("[DEBUG] - Next file     name      - %v", fi.Name())
+						log.Printf("[DEBUG] - Next file     mod time  - %v", fi.ModTime())
 						if filesList[out].Before(fi.ModTime()) {
 							log.Printf("[DEBUG] - File replaced with a newer version (REPLACE)\t%s\n", out)
 
@@ -283,10 +287,11 @@ func main() {
 									log.Println("[ERROR] - Error writing history. No further history will be recorded.")
 									historyFile.Close()
 								}
+								filesList[out] = fi.ModTime()
 							}
 						} else {
 							log.Printf("[DEBUG] - FIle not copied  (NOPE)\t%s\n", out)
-							_, err = historyFile.WriteString("SKIP - File already exist - " + path + "\n")
+							_, err = historyFile.WriteString("SKIP - Newer or same version of file already copied - " + path + "\n")
 							if err != nil {
 								log.Println(err)
 								log.Println("[ERROR] - Error writing history. No further history will be recorded.")
