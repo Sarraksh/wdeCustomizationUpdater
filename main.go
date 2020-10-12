@@ -6,7 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"github.com/gonutz/w32"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"golang.org/x/sys/windows/registry"
+	"gopkg.in/natefinch/lumberjack.v2"
 	"gopkg.in/yaml.v2"
 	"io"
 	"io/ioutil"
@@ -21,11 +24,11 @@ import (
 )
 
 const (
-	programVersion   string = "2.0.0.0"                                   // Program version.
+	programVersion   string = "2.0.1.0"                                   // Program version.
 	confFile         string = "config.yaml"                               // Configuration file name.
 	logHistLayout    string = "2006.01.02_150405"                         // Layout for "log" and "history" filenames time appending.
-	WDESubfolder     string = "InteractionWorkspace"                      // WDE subfolder in MainCfgYAML.WDEFolder.
-	DMSubfolder      string = "InteractionWorkspaceDeploymentManager"     // WDE Deployment Manager subfolder in MainCfgYAML.WDEFolder.
+	WDESubfolder     string = "InteractionWorkspace"                      // WDE subfolder in MainCfgYAML.WDEInstallationFolder.
+	DMSubfolder      string = "InteractionWorkspaceDeploymentManager"     // WDE Deployment Manager subfolder in MainCfgYAML.WDEInstallationFolder.
 	DMExecutableName string = "InteractionWorkspaceDeploymentManager.exe" // WDE Deployment Manager executable.
 	DMRegistryDir    string = `Software\Genesys\DeploymentManager`        // WDE Deployment Manager registry directory.
 	SavedRegFolder   string = "Registry"                                  // Folder name for saved registry data.
@@ -47,8 +50,13 @@ const (
 
 // For data from "config.yaml" file.
 type MainCfgYAML struct {
-	WDEFolder            string `yaml:"WDEFolder"`
-	CustomizationsFolder string `yaml:"CustomizationsFolder"`
+	WDEInstallationFolder string `yaml:"WDEInstallationFolder"`
+	CustomizationsFolder  string `yaml:"CustomizationsFolder"`
+	Log                   struct {
+		Folder  string `yaml:"Folder"`
+		Name    string `yaml:"Name"`
+		Verbose string `yaml:"Verbose"`
+	} `yaml:"Log"`
 }
 
 // Store file version in decimal.
@@ -60,7 +68,7 @@ type FileVersion struct {
 	v4   uint64
 }
 
-// Store fined customisation files with data needed for filtering, coping
+// Store fined customization files with data needed for filtering, coping
 // and propagate values for fill "CustomFiles" registry key.
 // Also used for parse data from previously saved "CustomFiles" registry key.
 type CustomizationFile struct {
@@ -128,9 +136,8 @@ func (rvs *RegistryValues) AddManuallyAddedOptions(finalFilesList []Customizatio
 		}
 		findKey = true
 		var err error
-		oldFilesList, err = ParseOldCustomFilesValue(value.Data)
+		oldFilesList, err = ParseOldCustomFilesValue([]byte(value.Data))
 		if err != nil {
-			log.Println(err)
 			return err
 		}
 		CFKeyID = id
@@ -186,46 +193,75 @@ type XMLCustomFiles struct {
 	ApplicationFile []CustomizationFile `xml:"ApplicationFile"`
 }
 
-// TODO - add logging logic (log to file, unified log format, add new log events)
-// TODO - test folders with spaces
 func main() {
 	// Fill program start information.
 	startTime := time.Now()                            //Save start time.
 	startTimeString := startTime.Format(logHistLayout) //Get string from startTime.
 	programDirectory, _ := os.Getwd()                  //Save program folder.
 
-	// Read configuration from file.
-	mainConfig, err := ReadConfigFromYAMLFile()
+	// Read configuration from file in working directory.
+	// If fail, try get program directory from os.Args.
+	mainConfig, err := ReadConfigFromYAMLFile(confFile)
 	if err != nil {
-		log.Printf("[FAIL    ] main - can't read confFile `%v`", confFile)
+		log.Printf("Can't read config file in current working directory `%v`", confFile)
 		log.Println(err)
-		return
-	}
-
-	// Get customisation folders list.
-	foldersWithCustomisations, err := GetCustomisationFoldersList(mainConfig.CustomizationsFolder)
-	if err != nil {
-		log.Println("[FAIL    ] main - can't get customisation folders list")
-		log.Println(err)
-		return
-	}
-
-	// Get all files from  all customisation folders.
-	rowFilesList := make([]CustomizationFile, 0, 128)
-	for _, folder := range foldersWithCustomisations {
-		scanPath := filepath.Join(mainConfig.CustomizationsFolder, folder)
-		tmpFilesList, err := CollectCustomisationFiles(scanPath, scanPath)
+		log.Println("Try get program folder from arguments")
+		programDirectory := filepath.Dir(os.Args[0])
+		confFileAbsolutePath := filepath.Join(programDirectory, confFile)
+		mainConfig, err = ReadConfigFromYAMLFile(confFileAbsolutePath)
 		if err != nil {
-			log.Println("[FAIL    ] main - can't get customisation files list")
+			log.Printf("Can't read config file `%v`", confFileAbsolutePath)
 			log.Println(err)
+			log.Println("Program exited")
+			return
+		}
+	}
+
+	// Initialisation logging subsystem
+	var logFullPath string
+	var logName string
+	if mainConfig.Log.Folder != "" {
+		logFullPath = mainConfig.Log.Folder
+	} else {
+		logFullPath = filepath.Join(programDirectory, "Log")
+	}
+	if mainConfig.Log.Name != "" {
+		logName = fmt.Sprint(mainConfig.Log.Name, "_", startTimeString, ".log")
+	} else {
+		logName = fmt.Sprint("WdeCustomizationUpdater_", startTimeString, ".log")
+	}
+	logFullPath = filepath.Join(logFullPath, logName)
+	logger := NewZapSimpleLoggerWithRotation(mainConfig.Log.Verbose, logFullPath, 10, 1)
+	defer logger.Sync()
+
+	// Get customization folders list.
+	logger.Info("Start collection customization folders")
+	foldersWithCustomizations, err := GetCustomizationFoldersList(mainConfig.CustomizationsFolder)
+	if err != nil {
+		logger.Error(fmt.Sprint("Customization folders collection error - ", err))
+		return
+	}
+	logger.Info("Customization folders collected")
+
+	// Get all files from  all customization folders.
+	logger.Info("Start collection customization files")
+	rowFilesList := make([]CustomizationFile, 0, 128)
+	for _, folder := range foldersWithCustomizations {
+		scanPath := filepath.Join(mainConfig.CustomizationsFolder, folder)
+		tmpFilesList, err := CollectCustomizationFiles(scanPath, scanPath)
+		if err != nil {
+			logger.Error(fmt.Sprint("Customization files collection error - ", err))
 			return
 		}
 		rowFilesList = append(rowFilesList, tmpFilesList...)
 	}
+	logger.Info("Customization files collected")
 
 	// Filtering redundant and older files.
 	// Get filtered files list and statuses of all original files.
+	logger.Info("Start validation customization files")
 	finalFilesList, rowFilesStatuses := ValidateCollectedFiles(rowFilesList)
+	logger.Info("Customization files validated")
 
 	// Write into history file initiator user name, program version
 	// and all original files with statuses.
@@ -241,28 +277,44 @@ func main() {
 		rowFilesList,
 		mainConfig.CustomizationsFolder,
 		rowFilesStatuses,
-		foldersWithCustomisations,
+		foldersWithCustomizations,
 		historyFileFullPath,
 		historyWritingEnd,
+		logger,
 	)
 
 	// Copy all filtered files into WDE folder.
-	err = CopyCustomisationFiles(finalFilesList, filepath.Join(mainConfig.WDEFolder, WDESubfolder))
+	logger.Info("Start copy validated customization files into WDE folder")
+	err = CopyCustomizationFiles(finalFilesList, filepath.Join(mainConfig.WDEInstallationFolder, WDESubfolder))
+	if err != nil {
+		logger.Error(fmt.Sprint("Fail copy customization files - ", err))
+		return
+	}
+	logger.Info("Validated customization files copied into WDE folder")
 
-	// TODO - avoid reading the file just written
 	// Read previously saved registry data.
 	// If there are no files to read, save the new registry data to a file and read from it.
-	savedRegistryFolder := filepath.Join(programDirectory, SavedRegFolder)
-	var previousRegData RegistryValues
-	previousRegData, err = ReadPreviouslySavedRegistryData(savedRegistryFolder)
+	logger.Info("Prepare registry data")
+	savedRegistryDir := filepath.Join(programDirectory, SavedRegFolder)
+	var regData RegistryValues
+	var RegDataByte []byte
+	logger.Info("Reading previously saved registry data")
+	RegDataByte, err = ReadPreviouslySavedRegistryData(savedRegistryDir)
 	if err != nil {
-		if err != ErrFolderContainNoFiles {
-			log.Println(err)
+		if err != ErrNoFilesFoundInFolderByPattern {
+			logger.Error(fmt.Sprint("Reading previously saved registry data from file failed - ", err))
 			return
 		}
-		registryPreBytes, err := SaveRegistryKeys(DMRegistryDir)
-		if err != nil {
-			log.Println(err)
+		logger.Info("No previously registry data saved. Try read from current user registry data")
+		regData, err = ReadRegistryData(DMRegistryDir)
+		switch err {
+		case nil:
+			logger.Info("Save current user registry data as initialisation data")
+		case registry.ErrNotExist:
+			logger.Info("No data in current user registry. Save zeroed initialisation data")
+			regData = make([]RegistryValue, 0, 32)
+		default:
+			logger.Error(fmt.Sprint("Reading current user registry data error - ", err))
 			return
 		}
 		registryFileFullPath := filepath.Join(
@@ -270,49 +322,71 @@ func main() {
 			SavedRegFolder,
 			fmt.Sprint(RegFileName, "INITIALISATION_", startTimeString, ".yaml"),
 		)
-		err = SaveBytesIntoFile(registryFileFullPath, registryPreBytes)
+		logger.Info("Marshal collected registry data")
+		RegDataByte, err = MarshalRegistryData(regData)
 		if err != nil {
-			log.Println(err)
+			logger.Error(fmt.Sprint("Can't marshal registry data into YAML - ", err))
 			return
 		}
-		previousRegData, err = ReadPreviouslySavedRegistryData(savedRegistryFolder)
+		logger.Info("Save Marshaled registry data into file")
+		err = SaveBytesIntoFile(registryFileFullPath, RegDataByte)
 		if err != nil {
-			log.Println(err)
+			logger.Error(fmt.Sprint("Can't save registry data into file - ", err))
+			return
+		}
+		logger.Info("Initialisation registry data saved")
+	} else {
+		logger.Info("Unmarshal previously saved registry data")
+		regData, err = UnmarshalRegistryData(RegDataByte)
+		if err != nil {
+			logger.Error(fmt.Sprint("Can't unmarshal registry data from YAML - ", err))
 			return
 		}
 	}
+	logger.Info("Registry data prepared")
 
-	//Update data previously saved from registry and now read from file.
-	previousRegData.InsertAddCustomFileTrueValue()                // Force set "AddCustomFile" with "True"
-	err = previousRegData.AddManuallyAddedOptions(finalFilesList) // Combine manually added options and new collected files.
+	// Update data previously saved from registry and now read from file.
+	logger.Info("Update old registry data with new data")
+	regData.InsertAddCustomFileTrueValue()                // Force set "AddCustomFile" with "True"
+	err = regData.AddManuallyAddedOptions(finalFilesList) // Combine manually added options and new collected files.
 	if err != nil {
 		if err == ErrCustomFilesNotFound {
-			previousRegData.InsertActualCustomFilesValue(ConstructCustomFilesRegistryKey(finalFilesList))
+			logger.Info("Old registry data contain not \"CustomFiles\" key. Add fully new data for \"CustomFiles\" key")
+			regData.InsertActualCustomFilesValue(ConstructCustomFilesRegistryKey(finalFilesList))
 		} else {
-			log.Println(err)
+			logger.Error(fmt.Sprint("Can't update old registry data with new data - ", err))
 		}
 	}
 
-	// Write collected from file and updated data into registry.
-	err = WriteToRegistry(previousRegData)
+	// Write prepared data into registry.
+	logger.Info("Start writing prepared data into registry")
+	err = WriteToRegistry(regData)
 	if err != nil {
+		logger.Error(fmt.Sprint("Can't write into registry - ", err))
 		log.Println(err)
 		return
 	}
+	logger.Info("Write into registry successful")
 
 	// Run WDE Deployment Manager and wait while it stop.
-	log.Printf("Run WDE Deployment Manager")
-	err = RunAndWaitStop(filepath.Join(mainConfig.WDEFolder, DMSubfolder, DMExecutableName))
+	logger.Info("Run WDE Deployment Manager")
+	err = RunAndWaitStop(filepath.Join(mainConfig.WDEInstallationFolder, DMSubfolder, DMExecutableName))
 	if err != nil {
-		log.Println(err)
+		logger.Error(fmt.Sprint("WDE deployment manager error - ", err))
 		return
 	}
-	log.Printf("WDE Deployment Manager stopped")
+	logger.Info("WDE Deployment Manager stopped")
 
 	// Save actual registry data into file.
-	registryBytes, err := SaveRegistryKeys(DMRegistryDir)
+	logger.Info("Save actual registry data into file")
+	regData, err = ReadRegistryData(DMRegistryDir)
 	if err != nil {
-		log.Println(err)
+		logger.Error(fmt.Sprint("Can't save registry data after WDE Deployment Manager - ", err))
+		return
+	}
+	registryBytes, err := MarshalRegistryData(regData)
+	if err != nil {
+		logger.Error(fmt.Sprint("Can't marshal registry data into YAML - ", err))
 		return
 	}
 	registryFileFullPath := filepath.Join(
@@ -322,227 +396,90 @@ func main() {
 	)
 	err = SaveBytesIntoFile(registryFileFullPath, registryBytes)
 	if err != nil {
+		logger.Error(fmt.Sprint("Can't save registry data into file - ", err))
 		log.Println(err)
 		return
 	}
+	logger.Info("Write data into file successful")
 
 	// Clean old registry files. Preserve last 5 files for backup purposes.
-	err = ClearOldFiles(filepath.Join(programDirectory, SavedRegFolder), RegFileName, 5)
+	logger.Info("Delete old registry files")
+	err = ClearOldFiles(filepath.Join(programDirectory, SavedRegFolder), RegFileName, 15)
 	if err != nil {
-		log.Printf("can't clear old registry files - '%v'", err)
+		logger.Error(fmt.Sprint("Can't delete old registry files - ", err))
 	}
+	logger.Info("Delete old log files")
+	err = ClearOldFiles(filepath.Join(programDirectory, SavedRegFolder), RegFileName, 15)
+	if err != nil {
+		logger.Error(fmt.Sprint("Can't delete old log files - ", err))
+	}
+	logger.Info("Old files cleared")
 
 	// Wait for the history file to finish writing end exit program.
-	log.Printf("History writing stopped '%v'", <-historyWritingEnd)
-	log.Println("[SUCCESS ] main")
-}
-
-// TODO - change oldCustomFiles argument type from string to []byte
-// Unmarshal XML from string and return CustomizationFile slice with filled
-// FileName, RelativePath, DataFile, EntryPoint, IsMainConfigFile, Optional and GroupName values.
-func ParseOldCustomFilesValue(oldCustomFiles string) ([]CustomizationFile, error) {
-	var oldData XMLCustomFiles
-	decoderXML := xml.NewDecoder(bytes.NewReader([]byte(oldCustomFiles)))
-	decoderXML.CharsetReader = IdentReader
-	err := decoderXML.Decode(&oldData)
-	if err != nil {
-		return []CustomizationFile{}, err
-	}
-	return oldData.ApplicationFile, nil
-}
-
-// Used in parse XML to avoid encoding mismatch.
-func IdentReader(encoding string, input io.Reader) (io.Reader, error) {
-	return input, nil
-}
-
-// Clear files in specified directory by specified name mask.
-// Preserve last N files by modified time.
-// Return error only if can't read directory or delete file.
-func ClearOldFiles(directory, filePrefix string, maxFiles int) error {
-	dirContent := make(FileInfoSlice, 0, 16)
-	dirContent, err := ioutil.ReadDir(directory)
-	if err != nil {
-		return err
-	}
-	if len(dirContent) <= maxFiles {
-		return nil
-	}
-	validFiles := make(FileInfoSlice, 0, 16)
-	rePrefix := regexp.MustCompile(filePrefix)
-	for _, entity := range dirContent {
-		if entity.IsDir() {
-			continue
-		}
-		if !rePrefix.MatchString(entity.Name()) {
-			continue
-		}
-		validFiles = append(validFiles, entity)
-	}
-	if len(validFiles) <= maxFiles {
-		return nil
-	}
-	// Sort fined files.
-	sort.Sort(validFiles)
-	last := 0
-	if len(validFiles) > maxFiles {
-		last = len(validFiles) - maxFiles
-	}
-	for _, vf := range validFiles[:last] {
-		fullPath := filepath.Join(directory, vf.Name())
-		// Execute windows delete command
-		winCommand := exec.Command("cmd", "/C", "del", fullPath)
-		err = winCommand.Run()
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-var ErrFolderContainNoFiles = fmt.Errorf("folder contains no files")
-
-// Read previously saved registry key/value data from file.
-// Automatically find latest .yaml file by name mask.
-func ReadPreviouslySavedRegistryData(savedRegistryDirectory string) ([]RegistryValue, error) {
-	// Read dir content.
-	dirContent, err := ioutil.ReadDir(savedRegistryDirectory)
-	if err != nil {
-		return []RegistryValue{}, err
-	}
-	var lastRegFile os.FileInfo
-
-	// Sort out folders and not yaml files and find newer file.
-	lastRegFile = nil
-	reYAML := regexp.MustCompile(`.yaml$`)
-	for _, file := range dirContent {
-		if file.IsDir() {
-			continue
-		}
-		if !reYAML.MatchString(file.Name()) {
-			continue
-		}
-		if lastRegFile == nil {
-			lastRegFile = file
-			continue
-		}
-		if lastRegFile.ModTime().Before(file.ModTime()) {
-			lastRegFile = file
-		} else {
-		}
-	}
-	if lastRegFile == nil {
-		return []RegistryValue{}, ErrFolderContainNoFiles
-	}
-
-	// Read data from file and unmarshal yaml.
-	fullFilePath := filepath.Join(savedRegistryDirectory, lastRegFile.Name())
-	regFile, err := os.Open(fullFilePath)
-	if err != nil {
-		return []RegistryValue{}, err
-	}
-	regBytes, err := ioutil.ReadAll(regFile)
-	if err != nil {
-		return []RegistryValue{}, err
-	}
-	registryData := make([]RegistryValue, 0, 32)
-	err = yaml.Unmarshal(regBytes, &registryData)
-	if err != nil {
-		return []RegistryValue{}, err
-	}
-	return registryData, nil
-}
-
-// Save provided byte slice into provided by full path file.
-// Automatically create directory and all needed parent directories.
-func SaveBytesIntoFile(fullPath string, bytesData []byte) error {
-	dirPath := filepath.Dir(fullPath)
-	err := os.MkdirAll(dirPath, 0755)
-	if err != nil {
-		return err
-	}
-	registryFile, err := os.Create(fullPath)
-	if err != nil {
-		return err
-	}
-	defer registryFile.Close()
-	_, err = registryFile.Write(bytesData)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-// TODO - !!! test case where no registry directory
-// TODO - change logic for mor reuse possibilities
-// Save keys/value pairs from registry into file.
-func SaveRegistryKeys(registryDir string) ([]byte, error) {
-	keyDir, err := registry.OpenKey(registry.CURRENT_USER, registryDir, registry.ENUMERATE_SUB_KEYS|registry.QUERY_VALUE)
-	if err != nil {
-		return nil, err
-	}
-	valueNames, err := keyDir.ReadValueNames(-1)
-	if err != nil {
-		return nil, err
-	}
-	regValues := make([]RegistryValue, 0, 32)
-	for _, name := range valueNames {
-		value, _, err := keyDir.GetStringValue(name)
-		if err != nil {
-			return nil, err
-		}
-		regValues = append(regValues, RegistryValue{Name: name, Data: value})
-	}
-	registryBytes, err := yaml.Marshal(regValues)
-	if err != nil {
-		return nil, err
-	}
-	return registryBytes, nil
-}
-
-// Run executable file provided by full path and wait for it stop.
-func RunAndWaitStop(fullPath string) error {
-	cmd := exec.Command(fullPath)
-	err := cmd.Start()
-	if err != nil {
-		return err
-	}
-	err = cmd.Wait()
-	if err != nil {
-		return err
-	}
-	return nil
+	logger.Info(fmt.Sprintf("History writing stopped '%v'", <-historyWritingEnd))
+	logger.Info("WDE customisation updated successful.")
 }
 
 // Extract configuration file and unmarshall collected data into config variable.
-func ReadConfigFromYAMLFile() (MainCfgYAML, error) {
+func ReadConfigFromYAMLFile(cfgFilePath string) (MainCfgYAML, error) {
 	log.Println("[START   ] ReadConfigFromYAMLFile")
-	file, err := os.Open(confFile)
+	file, err := os.Open(cfgFilePath)
 	if err != nil {
-		log.Println("[FAIL    ] GetCustomisationFoldersList")
+		log.Println("[FAIL    ] GetCustomizationFoldersList")
 		return MainCfgYAML{}, err
 	}
 	data, err := ioutil.ReadAll(file)
 	if err != nil {
-		log.Println("[FAIL    ] GetCustomisationFoldersList")
+		log.Println("[FAIL    ] GetCustomizationFoldersList")
 		return MainCfgYAML{}, err
 	}
 	var mainConfig MainCfgYAML
 	err = yaml.Unmarshal(data, &mainConfig)
 	if err != nil {
-		log.Println("[FAIL    ] GetCustomisationFoldersList")
+		log.Println("[FAIL    ] GetCustomizationFoldersList")
 		return MainCfgYAML{}, err
 	}
 	log.Println("[SUCCESS ] ReadConfigFromYAMLFile")
 	return mainConfig, nil
 }
 
+// Return simple logger with rotation. v1.
+// Take logging level, full path to log file, vax size of log file in MB and number of backup files.
+// Have no time limit for store log files
+func NewZapSimpleLoggerWithRotation(logLevelStr string, logFilePath string, maxSize, maxBackups int) *zap.Logger {
+	var logLevel zapcore.Level
+	err := logLevel.UnmarshalText([]byte(logLevelStr))
+	if err != nil {
+		logLevel = zapcore.ErrorLevel
+	}
+
+	var cfg zap.Config
+	cfg.EncoderConfig.TimeKey = "time"
+	cfg.EncoderConfig.MessageKey = "message"
+	cfg.EncoderConfig.LevelKey = "level"
+	cfg.EncoderConfig.EncodeTime = zapcore.TimeEncoderOfLayout("2006.01.02 15:04:05")
+	cfg.EncoderConfig.EncodeLevel = zapcore.CapitalLevelEncoder
+
+	writer := zapcore.AddSync(&lumberjack.Logger{
+		Filename:   logFilePath,
+		MaxSize:    maxSize, // megabytes
+		MaxBackups: maxBackups,
+	})
+
+	core := zapcore.NewCore(
+		zapcore.NewConsoleEncoder(cfg.EncoderConfig),
+		writer,
+		logLevel,
+	)
+	logger := zap.New(core)
+
+	return logger
+}
+
 // Get all folders in specified directory.
-func GetCustomisationFoldersList(directory string) ([]string, error) {
-	log.Println("[START   ] GetCustomisationFoldersList")
+func GetCustomizationFoldersList(directory string) ([]string, error) {
 	entries, err := ioutil.ReadDir(directory)
 	if err != nil {
-		log.Println("[FAIL    ] GetCustomisationFoldersList")
 		return nil, err
 	}
 	foldersList := make([]string, 0, 32)
@@ -551,29 +488,23 @@ func GetCustomisationFoldersList(directory string) ([]string, error) {
 		entryFullPath := filepath.Join(directory, entryName)
 		fileInfo, err := os.Stat(entryFullPath)
 		if err != nil {
-			log.Println("[FAIL    ] GetCustomisationFoldersList")
 			return nil, err
 		}
 		switch mode := fileInfo.Mode(); {
 		case mode.IsDir():
-			log.Printf("[     DIR] %s", entryName)
 			foldersList = append(foldersList, entryName)
 		default:
-			log.Printf("[    FILE] %s", entryName)
 		}
 	}
 	if len(foldersList) == 0 {
-		log.Println("[FAIL    ] GetCustomisationFoldersList")
 		return nil, errors.New(fmt.Sprint("Directory \"", directory, "\" does not contain subdirectories"))
 	}
-
-	log.Println("[SUCCESS ] GetCustomisationFoldersList")
 	return foldersList, nil
 }
 
-// Collect customisation files from provided directory and all subfolders.
+// Collect customization files from provided directory and all subfolders.
 // For each fined file extract all possible CustomizationFile values.
-func CollectCustomisationFiles(path, basePath string) ([]CustomizationFile, error) {
+func CollectCustomizationFiles(path, basePath string) ([]CustomizationFile, error) {
 	collectedFiles := make([]CustomizationFile, 0, 16)
 	err := filepath.Walk(path, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -619,6 +550,32 @@ func ExtractCustomFileInfo(fileInfo os.FileInfo, fullPath, basePath string) (Cus
 		LastWriteTime:    fileInfo.ModTime(),
 		Version:          fileVersion,
 	}, nil
+}
+
+var ErrVersionNotExist = fmt.Errorf("version not exsist")
+
+// Get file version from file info. Typically for .dll.
+func GetFileVersion(path string) (FileVersion, error) {
+	size := w32.GetFileVersionInfoSize(path)
+	if size <= 0 {
+		return FileVersion{}, ErrVersionNotExist
+	}
+	info := make([]byte, size)
+	ok := w32.GetFileVersionInfo(path, info)
+	if !ok {
+		return FileVersion{}, ErrVersionNotExist
+	}
+	fixed, ok := w32.VerQueryValueRoot(info)
+	if !ok {
+		return FileVersion{}, ErrVersionNotExist
+	}
+	version := fixed.FileVersion()
+	v1 := version & 0xFFFF000000000000 >> 48
+	v2 := version & 0x0000FFFF00000000 >> 32
+	v3 := version & 0x00000000FFFF0000 >> 16
+	v4 := version & 0x000000000000FFFF >> 0
+	log.Printf("file version: %d.%d.%d.%d\n", v1, v2, v3, v4)
+	return FileVersion{version, v1, v2, v3, v4}, nil
 }
 
 // Sort out all redundant files and older if present two or more files with equal FileName and RelativePath.
@@ -690,29 +647,31 @@ func WriteHistoryFile(
 	fileList []CustomizationFile,
 	customFilesFolder string,
 	fileStatuses,
-	customisationFolders []string,
+	customizationFolders []string,
 	historyFileFullPath string,
 	endChan chan bool,
+	logger *zap.Logger,
 ) {
 	defer DeferChannelSendTrue(endChan)
+	logger.Info("(WriteHistoryFile) Start writing to history file")
 	historyFolder := filepath.Dir(historyFileFullPath)
 	err := os.MkdirAll(historyFolder, 0755)
 	if err != nil {
-		log.Printf("WriteHistoryFile Error - '%+v'", err)
+		logger.Warn(fmt.Sprint("(WriteHistoryFile) History file not written - ", err))
 		return
 	}
 	historyFile, err := os.Create(historyFileFullPath)
 	if err != nil {
-		log.Printf("WriteHistoryFile Error - '%+v'", err)
+		logger.Warn(fmt.Sprint("(WriteHistoryFile) History file not written - ", err))
 		return
 	}
 	defer historyFile.Close()
+
 	// Get current user name
 	var currentUserName string
 	CurrentUser, err := user.Current()
 	if err != nil {
-		log.Println("[ERROR] - Can't get current username")
-		log.Println(err)
+		logger.Warn(fmt.Sprint("(WriteHistoryFile) Can't get current user name while save history- ", err))
 		currentUserName = "Can't resolve User Name"
 	} else {
 		if CurrentUser.Name == "" {
@@ -729,39 +688,40 @@ func WriteHistoryFile(
 		currentUserName,
 		"\n\nCollected folders\n"))
 	if err != nil {
-		log.Printf("WriteHistoryFile Error - '%+v'", err)
+		logger.Warn(fmt.Sprint("(WriteHistoryFile) History file not written - ", err))
 		return
 	}
-	// Write found customisation folders
-	for _, fName := range customisationFolders {
+	// Write found customization folders
+	for _, fName := range customizationFolders {
 		_, err = historyFile.WriteString(fmt.Sprint(fName, "\n"))
 		if err != nil {
-			log.Printf("WriteHistoryFile Error - '%+v'", err)
+			logger.Warn(fmt.Sprint("(WriteHistoryFile) History file not written - ", err))
 			return
 		}
 	}
 	// Write collected files statuses
 	_, err = historyFile.WriteString("\nCollected files statuses\n")
 	if err != nil {
-		log.Printf("WriteHistoryFile Error - '%+v'", err)
+		logger.Warn(fmt.Sprint("(WriteHistoryFile) History file not written - ", err))
 		return
 	}
 	for index, file := range fileList {
 		shortFilePath, err := filepath.Rel(customFilesFolder, file.SourcePath)
 		if err != nil {
-			log.Printf("WriteHistoryFile Error - '%+v'", err)
+			logger.Warn(fmt.Sprint("(WriteHistoryFile) History file not written - ", err))
 			return
 		}
 		fileStatusString := fmt.Sprint(fileStatuses[index], shortFilePath, "\n")
 		_, err = historyFile.WriteString(fileStatusString)
 		if err != nil {
-			log.Printf("WriteHistoryFile Error - '%+v'", err)
+			logger.Warn(fmt.Sprint("(WriteHistoryFile) History file not written - ", err))
 			return
 		}
 	}
+	logger.Info("(WriteHistoryFile) History file written successfully")
 	err = ClearOldFiles(historyFolder, HistoryFileName, 15)
 	if err != nil {
-		log.Printf("can't clear old history files - '%v'", err)
+		logger.Warn(fmt.Sprint("(WriteHistoryFile) Can't clear old history files - ", err))
 	}
 	return
 }
@@ -771,15 +731,14 @@ func DeferChannelSendTrue(endChan chan bool) {
 	endChan <- true
 }
 
-// TODO - replace CreateFolderIfNotExists with standard function
-// Copy customisation files, from custom folder into WDE folder  with save relative path.
+// Copy customization files, from custom folder into WDE folder  with save relative path.
 // Create subfolders if not exists.
-func CopyCustomisationFiles(list []CustomizationFile, targetDirectory string) error {
+func CopyCustomizationFiles(list []CustomizationFile, targetDirectory string) error {
 	for _, file := range list {
 		// Create subfolder if not exist
 		if file.RelativePath != "" {
-			err := CreateFolderIfNotExists(filepath.Join(targetDirectory, file.RelativePath))
-			if err != nil && err != ErrFolderAlreadyExist {
+			err := os.MkdirAll(filepath.Join(targetDirectory, file.RelativePath), 0755)
+			if err != nil {
 				return err
 			}
 		}
@@ -794,45 +753,112 @@ func CopyCustomisationFiles(list []CustomizationFile, targetDirectory string) er
 	return nil
 }
 
-// TODO - remove when replace CreateFolderIfNotExists with standard function
-var ErrFolderAlreadyExist = fmt.Errorf("folder already exsist")
+var ErrNoFilesFoundInFolderByPattern = fmt.Errorf("folder contains no files")
 
-// TODO - replace with standard function
-func CreateFolderIfNotExists(fullPath string) error {
-	_, err := os.Stat(fullPath)
+// Read previously saved registry key/value data from file.
+// Automatically find latest .yaml file by name mask.
+func ReadPreviouslySavedRegistryData(savedRegistryDirectory string) ([]byte, error) {
+	// Read dir content.
+	dirContent, err := ioutil.ReadDir(savedRegistryDirectory)
 	if err != nil {
-		if !os.IsNotExist(err) {
-			return err
+		return nil, err
+	}
+	var lastRegFile os.FileInfo
+
+	// Sort out folders and not yaml files and find newer file.
+	lastRegFile = nil
+	reYAML := regexp.MustCompile(`.yaml$`)
+	for _, file := range dirContent {
+		if file.IsDir() {
+			continue
 		}
-		err = os.Mkdir(fullPath, 777)
+		if !reYAML.MatchString(file.Name()) {
+			continue
+		}
+		if lastRegFile == nil {
+			lastRegFile = file
+			continue
+		}
+		if lastRegFile.ModTime().Before(file.ModTime()) {
+			lastRegFile = file
+		}
+	}
+	if lastRegFile == nil {
+		return nil, ErrNoFilesFoundInFolderByPattern
+	}
+
+	// Read data from file and unmarshal yaml.
+	fullFilePath := filepath.Join(savedRegistryDirectory, lastRegFile.Name())
+	regFile, err := os.Open(fullFilePath)
+	if err != nil {
+		return nil, err
+	}
+	regBytes, err := ioutil.ReadAll(regFile)
+	if err != nil {
+		return nil, err
+	}
+	return regBytes, nil
+}
+
+// Unmarshal yaml row text into []RegistryValue
+func UnmarshalRegistryData(regBytes []byte) ([]RegistryValue, error) {
+	registryData := make([]RegistryValue, 0, 32)
+	err := yaml.Unmarshal(regBytes, &registryData)
+	if err != nil {
+		return []RegistryValue{}, err
+	}
+	return registryData, nil
+}
+
+// Save keys/value pairs from registry into []RegistryValue.
+func ReadRegistryData(registryDir string) ([]RegistryValue, error) {
+	keyDir, err := registry.OpenKey(registry.CURRENT_USER, registryDir, registry.ENUMERATE_SUB_KEYS|registry.QUERY_VALUE)
+	if err != nil {
+		return nil, err
+	}
+	valueNames, err := keyDir.ReadValueNames(-1)
+	if err != nil {
+		return nil, err
+	}
+	regValues := make([]RegistryValue, 0, 32)
+	for _, name := range valueNames {
+		value, _, err := keyDir.GetStringValue(name)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		return nil
+		regValues = append(regValues, RegistryValue{Name: name, Data: value})
 	}
-	return ErrFolderAlreadyExist
+	return regValues, nil
 }
 
-// Write data into registry.
-func WriteToRegistry(registryData []RegistryValue) error {
-	// Open directory key DMRegistryDir with write privileges.
-	keyDir, _, err := registry.CreateKey(registry.CURRENT_USER, DMRegistryDir, registry.QUERY_VALUE|registry.SET_VALUE)
+// Marshal registry data for save into file.
+func MarshalRegistryData(regValues []RegistryValue) ([]byte, error) {
+	registryBytes, err := yaml.Marshal(regValues)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	// Write or rewrite child keys values
-	for _, key := range registryData {
-		if err := keyDir.SetStringValue(key.Name, key.Data); err != nil {
-			return err
-		}
-	}
-	if err := keyDir.Close(); err != nil {
-		return err
-	}
-	return nil
+	return registryBytes, nil
 }
 
-// Construct XML with format format valid for DM WDE.
+// Unmarshal XML from string and return CustomizationFile slice with filled
+// FileName, RelativePath, DataFile, EntryPoint, IsMainConfigFile, Optional and GroupName values.
+func ParseOldCustomFilesValue(oldCustomFiles []byte) ([]CustomizationFile, error) {
+	var oldData XMLCustomFiles
+	decoderXML := xml.NewDecoder(bytes.NewReader(oldCustomFiles))
+	decoderXML.CharsetReader = IdentReader
+	err := decoderXML.Decode(&oldData)
+	if err != nil {
+		return []CustomizationFile{}, err
+	}
+	return oldData.ApplicationFile, nil
+}
+
+// Used in parse XML to avoid encoding mismatch.
+func IdentReader(encoding string, input io.Reader) (io.Reader, error) {
+	return input, nil
+}
+
+// Construct XML with format valid for DM WDE.
 func ConstructCustomFilesRegistryKey(customFilesList []CustomizationFile) string {
 	result := RegFilesHeadXML
 	for _, file := range customFilesList {
@@ -862,28 +888,99 @@ func ConstructLineForCustomFilesRegistryKey(cf CustomizationFile) string {
 	)
 }
 
-var ErrVersionNotExist = fmt.Errorf("version not exsist")
+// Clear files in specified directory by specified name mask.
+// Preserve last N files by modified time.
+// Return error if can't read directory or delete file.
+func ClearOldFiles(directory, filePrefix string, maxFiles int) error {
+	dirContent := make(FileInfoSlice, 0, 16)
+	dirContent, err := ioutil.ReadDir(directory)
+	if err != nil {
+		return err
+	}
+	if len(dirContent) <= maxFiles {
+		return nil
+	}
+	validFiles := make(FileInfoSlice, 0, 16)
+	rePrefix := regexp.MustCompile(filePrefix)
+	for _, entity := range dirContent {
+		if entity.IsDir() {
+			continue
+		}
+		if !rePrefix.MatchString(entity.Name()) {
+			continue
+		}
+		validFiles = append(validFiles, entity)
+	}
+	if len(validFiles) <= maxFiles {
+		return nil
+	}
+	// Sort fined files.
+	sort.Sort(validFiles)
+	last := 0
+	if len(validFiles) > maxFiles {
+		last = len(validFiles) - maxFiles
+	}
+	for _, vf := range validFiles[:last] {
+		fullPath := filepath.Join(directory, vf.Name())
+		// Execute windows delete command
+		winCommand := exec.Command("cmd", "/C", "del", fullPath)
+		err = winCommand.Run()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
-// Get file version from file info. Typcaly for .dll.
-func GetFileVersion(path string) (FileVersion, error) {
-	size := w32.GetFileVersionInfoSize(path)
-	if size <= 0 {
-		return FileVersion{}, ErrVersionNotExist
+// Save provided byte slice into provided by full path file.
+// Automatically create directory and all needed parent directories.
+func SaveBytesIntoFile(fullPath string, bytesData []byte) error {
+	dirPath := filepath.Dir(fullPath)
+	err := os.MkdirAll(dirPath, 0755)
+	if err != nil {
+		return err
 	}
-	info := make([]byte, size)
-	ok := w32.GetFileVersionInfo(path, info)
-	if !ok {
-		return FileVersion{}, ErrVersionNotExist
+	registryFile, err := os.Create(fullPath)
+	if err != nil {
+		return err
 	}
-	fixed, ok := w32.VerQueryValueRoot(info)
-	if !ok {
-		return FileVersion{}, ErrVersionNotExist
+	defer registryFile.Close()
+	_, err = registryFile.Write(bytesData)
+	if err != nil {
+		return err
 	}
-	version := fixed.FileVersion()
-	v1 := version & 0xFFFF000000000000 >> 48
-	v2 := version & 0x0000FFFF00000000 >> 32
-	v3 := version & 0x00000000FFFF0000 >> 16
-	v4 := version & 0x000000000000FFFF >> 0
-	log.Printf("file version: %d.%d.%d.%d\n", v1, v2, v3, v4)
-	return FileVersion{version, v1, v2, v3, v4}, nil
+	return nil
+}
+
+// Write data into registry.
+func WriteToRegistry(registryData []RegistryValue) error {
+	// Open directory key DMRegistryDir with write privileges.
+	keyDir, _, err := registry.CreateKey(registry.CURRENT_USER, DMRegistryDir, registry.QUERY_VALUE|registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	// Write or rewrite child keys values
+	for _, key := range registryData {
+		if err := keyDir.SetStringValue(key.Name, key.Data); err != nil {
+			return err
+		}
+	}
+	if err := keyDir.Close(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Run executable file provided by full path and wait for it stop.
+func RunAndWaitStop(fullPath string) error {
+	cmd := exec.Command(fullPath)
+	err := cmd.Start()
+	if err != nil {
+		return err
+	}
+	err = cmd.Wait()
+	if err != nil {
+		return err
+	}
+	return nil
 }
