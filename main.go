@@ -24,7 +24,7 @@ import (
 )
 
 const (
-	programVersion   string = "2.0.1.0"                                   // Program version.
+	programVersion   string = "2.0.1.3"                                   // Program version.
 	confFile         string = "config.yaml"                               // Configuration file name.
 	logHistLayout    string = "2006.01.02_150405"                         // Layout for "log" and "history" filenames time appending.
 	WDESubfolder     string = "InteractionWorkspace"                      // WDE subfolder in MainCfgYAML.WDEInstallationFolder.
@@ -299,6 +299,11 @@ func main() {
 	var regData RegistryValues
 	var RegDataByte []byte
 	logger.Info("Reading previously saved registry data")
+	err = os.MkdirAll(savedRegistryDir, 0755)
+	if err != nil {
+		logger.Warn(fmt.Sprint("Can't create folder for previously saved registry - ", err))
+		return
+	}
 	RegDataByte, err = ReadPreviouslySavedRegistryData(savedRegistryDir)
 	if err != nil {
 		if err != ErrNoFilesFoundInFolderByPattern {
@@ -370,11 +375,12 @@ func main() {
 
 	// Run WDE Deployment Manager and wait while it stop.
 	logger.Info("Run WDE Deployment Manager")
-	err = RunAndWaitStop(filepath.Join(mainConfig.WDEInstallationFolder, DMSubfolder, DMExecutableName))
+	err = RunAndWaitStop(filepath.Join(mainConfig.WDEInstallationFolder, DMSubfolder), DMExecutableName, logger)
 	if err != nil {
 		logger.Error(fmt.Sprint("WDE deployment manager error - ", err))
 		return
 	}
+
 	logger.Info("WDE Deployment Manager stopped")
 
 	// Save actual registry data into file.
@@ -972,8 +978,11 @@ func WriteToRegistry(registryData []RegistryValue) error {
 }
 
 // Run executable file provided by full path and wait for it stop.
-func RunAndWaitStop(fullPath string) error {
-	cmd := exec.Command(fullPath)
+func RunAndWaitStop(directory, fileName string, logger *zap.Logger) error {
+	fileName = fmt.Sprint("./", fileName)
+	cmd := exec.Command(fileName)
+	cmd.Dir = directory
+	logger.Debug(fmt.Sprintf("Run file '%+v' from dir '%+v'", fileName, directory))
 	err := cmd.Start()
 	if err != nil {
 		return err
