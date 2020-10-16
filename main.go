@@ -24,7 +24,7 @@ import (
 )
 
 const (
-	programVersion   string = "2.0.1.3"                                   // Program version.
+	programVersion   string = "2.0.1.4"                                   // Program version.
 	confFile         string = "config.yaml"                               // Configuration file name.
 	logHistLayout    string = "2006.01.02_150405"                         // Layout for "log" and "history" filenames time appending.
 	WDESubfolder     string = "InteractionWorkspace"                      // WDE subfolder in MainCfgYAML.WDEInstallationFolder.
@@ -368,7 +368,6 @@ func main() {
 	err = WriteToRegistry(regData)
 	if err != nil {
 		logger.Error(fmt.Sprint("Can't write into registry - ", err))
-		log.Println(err)
 		return
 	}
 	logger.Info("Write into registry successful")
@@ -403,7 +402,6 @@ func main() {
 	err = SaveBytesIntoFile(registryFileFullPath, registryBytes)
 	if err != nil {
 		logger.Error(fmt.Sprint("Can't save registry data into file - ", err))
-		log.Println(err)
 		return
 	}
 	logger.Info("Write data into file successful")
@@ -580,7 +578,6 @@ func GetFileVersion(path string) (FileVersion, error) {
 	v2 := version & 0x0000FFFF00000000 >> 32
 	v3 := version & 0x00000000FFFF0000 >> 16
 	v4 := version & 0x000000000000FFFF >> 0
-	log.Printf("file version: %d.%d.%d.%d\n", v1, v2, v3, v4)
 	return FileVersion{version, v1, v2, v3, v4}, nil
 }
 
