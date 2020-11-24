@@ -24,7 +24,7 @@ import (
 )
 
 const (
-	programVersion   string = "2.0.1.4"                                   // Program version.
+	programVersion   string = "2.0.2.0"                                   // Program version.
 	confFile         string = "config.yaml"                               // Configuration file name.
 	logHistLayout    string = "2006.01.02_150405"                         // Layout for "log" and "history" filenames time appending.
 	WDESubfolder     string = "InteractionWorkspace"                      // WDE subfolder in MainCfgYAML.WDEInstallationFolder.
@@ -57,6 +57,7 @@ type MainCfgYAML struct {
 		Name    string `yaml:"Name"`
 		Verbose string `yaml:"Verbose"`
 	} `yaml:"Log"`
+	RedundantFiles []string `yaml:"RedundantFiles"`
 }
 
 // Store file version in decimal.
@@ -260,7 +261,7 @@ func main() {
 	// Filtering redundant and older files.
 	// Get filtered files list and statuses of all original files.
 	logger.Info("Start validation customization files")
-	finalFilesList, rowFilesStatuses := ValidateCollectedFiles(rowFilesList)
+	finalFilesList, rowFilesStatuses := ValidateCollectedFiles(rowFilesList, mainConfig.RedundantFiles, logger)
 	logger.Info("Customization files validated")
 
 	// Write into history file initiator user name, program version
@@ -582,14 +583,30 @@ func GetFileVersion(path string) (FileVersion, error) {
 }
 
 // Sort out all redundant files and older if present two or more files with equal FileName and RelativePath.
-func ValidateCollectedFiles(list []CustomizationFile) ([]CustomizationFile, []string) {
+func ValidateCollectedFiles(list []CustomizationFile, redundantCFG []string, logger *zap.Logger) ([]CustomizationFile, []string) {
 	listLength := len(list)
 	statuses := make([]string, listLength)
 	resultList := make([]CustomizationFile, 0, listLength)
 	redundancyRegexps := make([]*regexp.Regexp, 0, 16)
-	redundancyRegexps = append(redundancyRegexps, regexp.MustCompile(`[Rr][Ee][Aa][Dd][Mm][Ee]`))
-	redundancyRegexps = append(redundancyRegexps, regexp.MustCompile(`\.[Pp][Dd][Bb]$`))
-	redundancyRegexps = append(redundancyRegexps, regexp.MustCompile(`\.[Mm][Dd]$`))
+
+	// Convert redundant files patterns from config for handle case sensitivity and match only file extensions if leading by dot.
+	for _, rf := range redundantCFG {
+		if string(rf[0]) == "." {
+			rf = fmt.Sprint(rf, "$")
+		}
+		rf = fmt.Sprint("(?i)", rf)
+		logger.Debug(fmt.Sprintf("redundant regexp result    - '%+v'", rf))
+		redundancyRegexps = append(redundancyRegexps, regexp.MustCompile(rf))
+	}
+
+	// Hardcode basic redundant file patterns to avoid human factor
+	logger.Debug(fmt.Sprintf("redundant regexp mandatory - '%+v'", `(?i)readme`))
+	logger.Debug(fmt.Sprintf("redundant regexp mandatory - '%+v'", `(?i)\.pdb$`))
+	logger.Debug(fmt.Sprintf("redundant regexp mandatory - '%+v'", `(?i)\.md$`))
+	redundancyRegexps = append(redundancyRegexps, regexp.MustCompile(`(?i)readme`))
+	redundancyRegexps = append(redundancyRegexps, regexp.MustCompile(`(?i)\.pdb$`))
+	redundancyRegexps = append(redundancyRegexps, regexp.MustCompile(`(?i)\.md$`))
+
 	for currentFileIndex, currentFile := range list {
 		if statuses[currentFileIndex] != "" {
 			continue

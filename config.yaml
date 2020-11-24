@@ -1,2 +1,8 @@
 CustomizationsFolder: C:\WorkSpace\Programming\Test\From #each customization must be in it's own subfolder
 WDEFolder: C:\WorkSpace\Programming\Test\To
+Log :
+  Folder: Log
+  Verbose: debug
+RedundantFiles:
+  - .txt # redundant file extensions must be leading by dot
+  - log # redundant file name (can be any part of file including extension)
